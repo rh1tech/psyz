@@ -398,7 +398,9 @@ void Psyz_CdSetReadCB(PsyzCdReadCB cb) { disk_read_cb = cb; }
 static FILE* track_file;
 static const TrackEntry* track_file_track;
 
+static void xa_pre_clear(void);
 static void close_track_file(void) {
+    xa_pre_clear();
     if (track_file) {
         fclose(track_file);
         track_file = NULL;
@@ -472,11 +474,14 @@ static struct {
     short rh_l[4], rh_r[4];
     unsigned int phase; // 16.16 fractional position into the input stream
     int cur_abs_sector; // absolute last sector used, for CdlGetlocL
+    int read_abs;       // absolute last sector read from the image
     int last_match;     // absolute sector of the last decoded XA sector
     int stride;         // learned gap between this stream's sectors, 0: scan
 } xa;
 
+static void xa_pre_clear(void);
 static void xa_reset_stream(void) {
+    xa_pre_clear();
     xa.last_match = -1;
     xa.stride = 0;
     xa.decoded_count = 0;
@@ -581,8 +586,9 @@ static int xa_decode_sector(const unsigned char* sector) {
     return 1;
 }
 
-static int xa_read_and_decode_sector(void) {
-    unsigned char sector[SECTOR_SIZE];
+// Read the next sector of the selected XA stream into `sector`; *abs gets
+// its absolute position. Returns 0 at the end of the track.
+static int xa_fetch_matching(unsigned char* sector, int* abs) {
     // Interleaved streams: once two matching sectors show the gap between
     // them, jump straight to the next expected one instead of reading every
     // other channel's sectors too (7 of 8 on SOTN, slow on embedded storage).
@@ -595,10 +601,11 @@ static int xa_read_and_decode_sector(void) {
             fread(sector, 1, SECTOR_SIZE, track_file) == SECTOR_SIZE &&
             (sector[0x12] & 0x44) == 0x44 &&
             xa_sector_matches(sector[0x10], sector[0x11])) {
-            xa.cur_abs_sector += xa.stride;
-            xa.last_match = xa.cur_abs_sector;
+            xa.read_abs += xa.stride;
+            xa.last_match = xa.read_abs;
             psyz_xa_stride_hits++;
-            return xa_decode_sector(sector);
+            *abs = xa.read_abs;
+            return 1;
         }
         xa.stride = 0;
         if (here < 0 || fseek(track_file, here, SEEK_SET) != 0) {
@@ -610,7 +617,7 @@ static int xa_read_and_decode_sector(void) {
         if (n != SECTOR_SIZE) {
             return 0; // EOF or short read
         }
-        xa.cur_abs_sector++;
+        xa.read_abs++;
         const unsigned char file = sector[0x10];
         const unsigned char channel = sector[0x11];
         const unsigned char submode = sector[0x12];
@@ -620,11 +627,61 @@ static int xa_read_and_decode_sector(void) {
         if (!xa_sector_matches(file, channel)) {
             continue;
         }
-        int gap = xa.cur_abs_sector - xa.last_match;
+        int gap = xa.read_abs - xa.last_match;
         xa.stride = (xa.last_match >= 0 && gap > 1 && gap <= 32) ? gap : 0;
-        xa.last_match = xa.cur_abs_sector;
+        xa.last_match = xa.read_abs;
+        *abs = xa.read_abs;
+        return 1;
+    }
+}
+
+// Read-ahead of matching XA sectors (Psyz_CdPrefetch). On slow storage a
+// sector read takes milliseconds; the platform fetches ahead at a moment it
+// chooses, so the mixer only decodes. Each entry keeps its position, so
+// CdlGetlocL still reports the sector actually being played.
+#define XA_PRE 3
+static unsigned char* xa_pre_buf;
+static int xa_pre_abs[XA_PRE];
+static int xa_pre_head, xa_pre_count;
+
+static void xa_pre_clear(void) { xa_pre_head = xa_pre_count = 0; }
+
+static int xa_read_and_decode_sector(void) {
+    if (xa_pre_count > 0) {
+        unsigned char* sector = xa_pre_buf + xa_pre_head * SECTOR_SIZE;
+        xa.cur_abs_sector = xa_pre_abs[xa_pre_head];
+        xa_pre_head = (xa_pre_head + 1) % XA_PRE;
+        xa_pre_count--;
         return xa_decode_sector(sector);
     }
+    unsigned char sector[SECTOR_SIZE];
+    int abs;
+    if (!xa_fetch_matching(sector, &abs)) {
+        return 0;
+    }
+    xa.cur_abs_sector = abs;
+    return xa_decode_sector(sector);
+}
+
+// Fill the XA read-ahead. Call from the game thread whenever storage access
+// is cheap to schedule (e.g. while waiting for the GPU). No-op unless an XA
+// stream is playing.
+void Psyz_CdPrefetch(void) {
+    Psyz_AudioLock();
+    if (is_playing && xa.active && track_file) {
+        if (!xa_pre_buf) {
+            xa_pre_buf = malloc(XA_PRE * SECTOR_SIZE);
+        }
+        while (xa_pre_buf && xa_pre_count < XA_PRE) {
+            int slot = (xa_pre_head + xa_pre_count) % XA_PRE;
+            if (!xa_fetch_matching(xa_pre_buf + slot * SECTOR_SIZE,
+                                   &xa_pre_abs[slot])) {
+                break;
+            }
+            xa_pre_count++;
+        }
+    }
+    Psyz_AudioUnlock();
 }
 
 // Pull next 37800 Hz stereo input frame into the Hermite ring buffers.
@@ -863,6 +920,7 @@ static void psyz_xa_read(void) {
     Psyz_AudioLock();
     xa_reset_stream();
     xa.cur_abs_sector = CdPosToInt(&CD_pos) - 1;
+    xa.read_abs = xa.cur_abs_sector;
     xa.active = 1;
     is_playing = 1;
     Psyz_AudioUnlock();
