@@ -370,10 +370,17 @@ static void spu_tick(short* out) {
         reverb_input_left = reverb_input_right = 0;
     }
 
+#ifndef PSYZ_SPU_NO_REVERB
+    // Embedded targets can drop reverb: its work area lives in SPU RAM and
+    // costs dozens of scattered memory accesses per sample.
     reverb_tick(
         clamp16(reverb_input_left), clamp16(reverb_input_right), reverb_output);
     left_sum += reverb_mul(reverb_output[0], rxx->rev_vol.left);
     right_sum += reverb_mul(reverb_output[1], rxx->rev_vol.right);
+#else
+    (void)reverb_tick;
+    (void)reverb_output;
+#endif
 
     // Mix CD audio per SPUCNT and cd_vol registers.
     if (spucnt & SPU_CTRL_MASK_CD_AUDIO_ENABLE) {
