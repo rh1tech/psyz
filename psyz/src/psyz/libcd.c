@@ -476,12 +476,14 @@ static struct {
     int cur_abs_sector; // absolute last sector used, for CdlGetlocL
     int read_abs;       // absolute last sector read from the image
     int last_match;     // absolute sector of the last decoded XA sector
+    int drift;          // no sector of the stream nearby: advance at drive pace
     int stride;         // learned gap between this stream's sectors, 0: scan
 } xa;
 
 static void xa_pre_clear(void);
 static void xa_reset_stream(void) {
     xa_pre_clear();
+    xa.drift = 0;
     xa.last_match = -1;
     xa.stride = 0;
     xa.decoded_count = 0;
@@ -587,8 +589,31 @@ static int xa_decode_sector(const unsigned char* sector) {
 }
 
 // Read the next sector of the selected XA stream into `sector`; *abs gets
-// its absolute position. Returns 0 at the end of the track.
+// its absolute position. Returns 1 when found, 0 at the end of the track,
+// and -1 after scanning XA_SCAN_MAX sectors without a match (the filter
+// selects a channel the disc has no data for here: a drive keeps reading,
+// the music is silent; reading on in one go could mean hundreds of MB).
+#define XA_SCAN_MAX 32
 static int xa_fetch_matching(unsigned char* sector, int* abs) {
+    int scanned = 0;
+    if (xa.drift) {
+        // A 2x drive covers ~8 sectors in the 53 ms of one silent block:
+        // skip 7 unread, look at the 8th.
+        if (fseek(track_file, 7L * SECTOR_SIZE, SEEK_CUR) != 0 ||
+            fread(sector, 1, SECTOR_SIZE, track_file) != SECTOR_SIZE) {
+            return 0;
+        }
+        xa.read_abs += 8;
+        if ((sector[0x12] & 0x44) == 0x44 &&
+            xa_sector_matches(sector[0x10], sector[0x11])) {
+            xa.drift = 0;
+            xa.stride = 0;
+            xa.last_match = xa.read_abs;
+            *abs = xa.read_abs;
+            return 1;
+        }
+        return -1;
+    }
     // Interleaved streams: once two matching sectors show the gap between
     // them, jump straight to the next expected one instead of reading every
     // other channel's sectors too (7 of 8 on SOTN, slow on embedded storage).
@@ -613,6 +638,10 @@ static int xa_fetch_matching(unsigned char* sector, int* abs) {
         }
     }
     while (1) {
+        if (scanned++ >= XA_SCAN_MAX) {
+            xa.drift = 1;
+            return -1;
+        }
         const size_t n = fread(sector, 1, SECTOR_SIZE, track_file);
         if (n != SECTOR_SIZE) {
             return 0; // EOF or short read
@@ -656,8 +685,17 @@ static int xa_read_and_decode_sector(void) {
     }
     unsigned char sector[SECTOR_SIZE];
     int abs;
-    if (!xa_fetch_matching(sector, &abs)) {
+    int r = xa_fetch_matching(sector, &abs);
+    if (r == 0) {
         return 0;
+    }
+    if (r < 0) {
+        // nothing for this channel yet: a block of silence, time moves on
+        memset(xa.decoded, 0, 2016 * 2 * sizeof(short));
+        xa.decoded_count = 2016;
+        xa.decoded_pos = 0;
+        xa.cur_abs_sector = xa.read_abs;
+        return 1;
     }
     xa.cur_abs_sector = abs;
     return xa_decode_sector(sector);
@@ -668,15 +706,15 @@ static int xa_read_and_decode_sector(void) {
 // stream is playing.
 void Psyz_CdPrefetch(void) {
     Psyz_AudioLock();
-    if (is_playing && xa.active && track_file) {
+    if (is_playing && xa.active && track_file && !xa.drift) {
         if (!xa_pre_buf) {
             xa_pre_buf = malloc(XA_PRE * SECTOR_SIZE);
         }
         while (xa_pre_buf && xa_pre_count < XA_PRE) {
             int slot = (xa_pre_head + xa_pre_count) % XA_PRE;
-            if (!xa_fetch_matching(xa_pre_buf + slot * SECTOR_SIZE,
-                                   &xa_pre_abs[slot])) {
-                break;
+            if (xa_fetch_matching(xa_pre_buf + slot * SECTOR_SIZE,
+                                  &xa_pre_abs[slot]) <= 0) {
+                break; // end of track, or nothing nearby: try next time
             }
             xa_pre_count++;
         }
