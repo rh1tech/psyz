@@ -472,9 +472,13 @@ static struct {
     short rh_l[4], rh_r[4];
     unsigned int phase; // 16.16 fractional position into the input stream
     int cur_abs_sector; // absolute last sector used, for CdlGetlocL
+    int last_match;     // absolute sector of the last decoded XA sector
+    int stride;         // learned gap between this stream's sectors, 0: scan
 } xa;
 
 static void xa_reset_stream(void) {
+    xa.last_match = -1;
+    xa.stride = 0;
     xa.decoded_count = 0;
     xa.decoded_pos = 0;
     xa.hist_l_old = xa.hist_l_older = 0;
@@ -555,8 +559,52 @@ static int xa_decode_user_mono_4bit(const unsigned char* user) {
     return frame;
 }
 
+// diagnostics for embedded ports: XA sectors decoded / reached by stride
+unsigned psyz_xa_sectors, psyz_xa_stride_hits;
+
+static int xa_decode_sector(const unsigned char* sector) {
+    psyz_xa_sectors++;
+    const unsigned char ci = sector[0x13];
+    const unsigned char* user = &sector[0x18];
+    int stereo = (ci & 0x03) == 1;
+    int rate18900 = (ci & 0x04) != 0;
+    int bits8 = (ci & 0x30) != 0;
+    if (rate18900 || bits8) {
+        LOG_ONCE("XA: 18900Hz or 8-bit not supported, decoding as 4bit/37800");
+    }
+    if (stereo) {
+        xa.decoded_count = xa_decode_user_stereo_4bit(user);
+    } else {
+        xa.decoded_count = xa_decode_user_mono_4bit(user);
+    }
+    xa.decoded_pos = 0;
+    return 1;
+}
+
 static int xa_read_and_decode_sector(void) {
     unsigned char sector[SECTOR_SIZE];
+    // Interleaved streams: once two matching sectors show the gap between
+    // them, jump straight to the next expected one instead of reading every
+    // other channel's sectors too (7 of 8 on SOTN, slow on embedded storage).
+    // Anything unexpected falls back to the sequential scan.
+    if (xa.stride > 1 && (CD_mode & CdlModeSF)) {
+        long here = ftell(track_file);
+        if (here >= 0 &&
+            fseek(track_file, (long)(xa.stride - 1) * SECTOR_SIZE, SEEK_CUR) ==
+                0 &&
+            fread(sector, 1, SECTOR_SIZE, track_file) == SECTOR_SIZE &&
+            (sector[0x12] & 0x44) == 0x44 &&
+            xa_sector_matches(sector[0x10], sector[0x11])) {
+            xa.cur_abs_sector += xa.stride;
+            xa.last_match = xa.cur_abs_sector;
+            psyz_xa_stride_hits++;
+            return xa_decode_sector(sector);
+        }
+        xa.stride = 0;
+        if (here < 0 || fseek(track_file, here, SEEK_SET) != 0) {
+            return 0;
+        }
+    }
     while (1) {
         const size_t n = fread(sector, 1, SECTOR_SIZE, track_file);
         if (n != SECTOR_SIZE) {
@@ -566,28 +614,16 @@ static int xa_read_and_decode_sector(void) {
         const unsigned char file = sector[0x10];
         const unsigned char channel = sector[0x11];
         const unsigned char submode = sector[0x12];
-        const unsigned char ci = sector[0x13];
         if ((submode & 0x44) != 0x44) {
             continue; // data sector, skip from XA stream
         }
         if (!xa_sector_matches(file, channel)) {
             continue;
         }
-        const unsigned char* user = &sector[0x18];
-        int stereo = (ci & 0x03) == 1;
-        int rate18900 = (ci & 0x04) != 0;
-        int bits8 = (ci & 0x30) != 0;
-        if (rate18900 || bits8) {
-            LOG_ONCE(
-                "XA: 18900Hz or 8-bit not supported, decoding as 4bit/37800");
-        }
-        if (stereo) {
-            xa.decoded_count = xa_decode_user_stereo_4bit(user);
-        } else {
-            xa.decoded_count = xa_decode_user_mono_4bit(user);
-        }
-        xa.decoded_pos = 0;
-        return 1;
+        int gap = xa.cur_abs_sector - xa.last_match;
+        xa.stride = (xa.last_match >= 0 && gap > 1 && gap <= 32) ? gap : 0;
+        xa.last_match = xa.cur_abs_sector;
+        return xa_decode_sector(sector);
     }
 }
 
