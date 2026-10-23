@@ -1206,6 +1206,22 @@ void SetGeomOffset(long ofx, long ofy) {
 
 void SetGeomScreen(long h) { H = h; }
 
+MATRIX* SetMulMatrix(MATRIX* m0, MATRIX* m1) {
+    // m0 * m1 into the GTE rotation matrix
+    MATRIX t;
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            s32 acc = 0;
+            for (int k = 0; k < 3; k++) {
+                acc += (s32)m0->m[i][k] * m1->m[k][j];
+            }
+            t.m[i][j] = (s16)(acc >> 12); // 4.12 fixed point
+        }
+    }
+    SetRotMatrix(&t);
+    return m0;
+}
+
 void SetRotMatrix(MATRIX* m) {
     M.m[0][0] = m->m[0][0];
     M.m[0][1] = m->m[0][1];
