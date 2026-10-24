@@ -14,6 +14,7 @@ _Static_assert(
 #define CD_RING_FRAMES 4096               // must be power of 2
 #define CD_RING_MASK (CD_RING_FRAMES - 1) // ring wrapper
 #define CD_RING_LOW_WATER 1024            // refill when short of N frames
+#define CD_RING_REFILL_MAX 128            // frames pulled per tick at most
 
 // Embedded builds whose .bss lives in slow external RAM keep the state read
 // for every sample in internal SRAM (the section is the RP2350 port's).
@@ -337,6 +338,10 @@ static void spu_tick(short* out) {
         size_t chunk = CD_RING_FRAMES - write_pos;
         if (chunk > space)
             chunk = space;
+        // a little at a time: one tick refilling the whole ring decodes and
+        // resamples ~3000 frames while the caller holds the audio lock
+        if (chunk > CD_RING_REFILL_MAX)
+            chunk = CD_RING_REFILL_MAX;
         size_t got = Psyz_CdPullSamples(&spu.cd_ring[write_pos * 2], chunk);
         spu_hot.cd_ring_count += got;
     }
