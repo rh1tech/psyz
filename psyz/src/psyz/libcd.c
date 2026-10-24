@@ -731,6 +731,15 @@ void Psyz_CdPrefetch(void) {
     Psyz_AudioUnlock();
 }
 
+// Sectors waiting in the read-ahead; XA_PRE when no XA stream needs any (so
+// the platform can tell an urgent refill from one that can wait).
+int Psyz_CdPrefetchLevel(void) {
+    if (!(is_playing && xa.active && track_file && !xa.drift)) {
+        return XA_PRE;
+    }
+    return xa_pre_count;
+}
+
 // Pull next 37800 Hz stereo input frame into the Hermite ring buffers.
 // Returns 1 on success, 0 if stream ended, -1 if starved (see above).
 static int xa_advance_input(void) {
