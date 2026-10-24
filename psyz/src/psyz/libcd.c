@@ -675,6 +675,12 @@ static int xa_pre_head, xa_pre_count;
 
 static void xa_pre_clear(void) { xa_pre_head = xa_pre_count = 0; }
 
+// Platforms where storage belongs to one thread (the RP2350 port mixes on
+// both cores, the SD card is core 0's) say whether this thread may read it.
+__attribute__((weak)) int Psyz_CdReadAllowed(void) { return 1; }
+
+// 1 decoded, 0 end of the track, -1 starved: nothing read ahead and this
+// thread may not read (try again next pull)
 static int xa_read_and_decode_sector(void) {
     if (xa_pre_count > 0) {
         unsigned char* sector = xa_pre_buf + xa_pre_head * SECTOR_SIZE;
@@ -682,6 +688,9 @@ static int xa_read_and_decode_sector(void) {
         xa_pre_head = (xa_pre_head + 1) % XA_PRE;
         xa_pre_count--;
         return xa_decode_sector(sector);
+    }
+    if (!Psyz_CdReadAllowed()) {
+        return -1;
     }
     unsigned char sector[SECTOR_SIZE];
     int abs;
@@ -723,11 +732,12 @@ void Psyz_CdPrefetch(void) {
 }
 
 // Pull next 37800 Hz stereo input frame into the Hermite ring buffers.
-// Returns 1 on success, 0 if stream ended.
+// Returns 1 on success, 0 if stream ended, -1 if starved (see above).
 static int xa_advance_input(void) {
     if (xa.decoded_pos >= xa.decoded_count) {
-        if (!xa_read_and_decode_sector()) {
-            return 0;
+        int r = xa_read_and_decode_sector();
+        if (r <= 0) {
+            return r;
         }
     }
     short l = xa.decoded[xa.decoded_pos * 2 + 0];
@@ -772,7 +782,11 @@ static size_t xa_pull_samples(short* buf, size_t max_frames) {
     // Prime Hermite ring on first call so we have y0..y2 valid.
     while (xa.rh_l[3] == 0 && xa.rh_l[2] == 0 && xa.rh_l[1] == 0 &&
            xa.decoded_pos == 0 && xa.decoded_count == 0) {
-        if (!xa_advance_input()) {
+        int r = xa_advance_input();
+        if (r < 0) {
+            goto end;
+        }
+        if (!r) {
             hit_eof = 1;
             goto end;
         }
@@ -782,7 +796,11 @@ static size_t xa_pull_samples(short* buf, size_t max_frames) {
     while (written < max_frames) {
         // Advance input as many times as needed to get phase < 1.0.
         while (xa.phase >= 0x10000) {
-            if (!xa_advance_input()) {
+            int r = xa_advance_input();
+            if (r < 0) {
+                goto end; // starved: resume at this phase next pull
+            }
+            if (!r) {
                 hit_eof = 1;
                 goto end;
             }

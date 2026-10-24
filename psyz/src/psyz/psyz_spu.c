@@ -15,10 +15,23 @@ _Static_assert(
 #define CD_RING_MASK (CD_RING_FRAMES - 1) // ring wrapper
 #define CD_RING_LOW_WATER 1024            // refill when short of N frames
 
-// Full SPU state
+// Embedded builds whose .bss lives in slow external RAM keep the state read
+// for every sample in internal SRAM (the section is the RP2350 port's).
+#ifdef PSYZ_SPU_HOT_SRAM
+#define SPU_HOT __attribute__((section(".bss_sram.psyz_spu")))
+#else
+#define SPU_HOT
+#endif
+
+// SPU RAM and the CD ring: big, read a block at a time
 static struct {
     u8 ram[PSYZ_SPU_RAM_SIZE];
+    // CD audio ring buffer, refilled by Psyz_CdPullSamples
+    short cd_ring[CD_RING_FRAMES * N_CHANNELS];
+} spu;
 
+// Everything else: touched for every voice of every sample
+static struct {
     // Transfer address (byte address into SPU RAM)
     unsigned transfer_addr;
 
@@ -32,21 +45,20 @@ static struct {
 
     VoiceState voice[PSYZ_SPU_NUM_VOICES];
 
-    // CD audio ring buffer, refilled by Psyz_CdPullSamples
-    short cd_ring[CD_RING_FRAMES * N_CHANNELS];
     unsigned cd_ring_read;
     unsigned cd_ring_count; // number of valid frames in ring
 
     u8 initialized;
-} spu;
+} spu_hot SPU_HOT;
 
 u8* Psyz_SpuGetRam(void) { return spu.ram; }
 
 void Psyz_SpuInit(void) {
-    if (spu.initialized)
+    if (spu_hot.initialized)
         return;
     memset(&spu, 0, sizeof(spu));
-    spu.initialized = 1;
+    memset(&spu_hot, 0, sizeof(spu_hot));
+    spu_hot.initialized = 1;
     INFOF("SPU emulation initialized");
 }
 
@@ -56,13 +68,17 @@ static void spu_reset(void) {
         _spu_RXX->rxx.voice[v].volumex = 0;
     }
     memset(&spu, 0, sizeof(spu));
+    memset(&spu_hot, 0, sizeof(spu_hot));
 }
 
+// keeps SPU RAM: only the voices, the CD ring and the registers start over
 static void spu_reset_hot(void) {
-    u8 saved_ram[PSYZ_SPU_RAM_SIZE];
-    memcpy(saved_ram, spu.ram, PSYZ_SPU_RAM_SIZE);
-    spu_reset();
-    memcpy(spu.ram, saved_ram, PSYZ_SPU_RAM_SIZE);
+    _spu_RXX->rxx.spustat = 0;
+    for (int v = 0; v < PSYZ_SPU_NUM_VOICES; v++) {
+        _spu_RXX->rxx.voice[v].volumex = 0;
+    }
+    memset(spu.cd_ring, 0, sizeof(spu.cd_ring));
+    memset(&spu_hot, 0, sizeof(spu_hot));
 }
 
 void Psyz_SpuReset(int hot) {
@@ -71,28 +87,28 @@ void Psyz_SpuReset(int hot) {
     } else {
         spu_reset();
     }
-    spu.initialized = 1;
+    spu_hot.initialized = 1;
 }
 
 void Psyz_SpuSetTransferAddr(unsigned int addr) {
-    spu.transfer_addr = addr & (PSYZ_SPU_RAM_SIZE - 1);
+    spu_hot.transfer_addr = addr & (PSYZ_SPU_RAM_SIZE - 1);
 }
 
-unsigned int Psyz_SpuGetTransferAddr(void) { return spu.transfer_addr; }
+unsigned int Psyz_SpuGetTransferAddr(void) { return spu_hot.transfer_addr; }
 
 void Psyz_SpuFifoWrite(unsigned short word) {
 #ifdef PLATFORM_LE
-    *(unsigned short*)&spu.ram[spu.transfer_addr] = word;
+    *(unsigned short*)&spu.ram[spu_hot.transfer_addr] = word;
 #else
-    spu.ram[spu.transfer_addr] = (unsigned char)(word & 0xFF);
-    spu.ram[spu.transfer_addr + 1] = (unsigned char)((word >> 8) & 0xFF);
+    spu.ram[spu_hot.transfer_addr] = (unsigned char)(word & 0xFF);
+    spu.ram[spu_hot.transfer_addr + 1] = (unsigned char)((word >> 8) & 0xFF);
 #endif
-    spu.transfer_addr = (spu.transfer_addr + 2) & (PSYZ_SPU_RAM_SIZE - 1);
+    spu_hot.transfer_addr = (spu_hot.transfer_addr + 2) & (PSYZ_SPU_RAM_SIZE - 1);
 }
 
 void Psyz_SpuFifoWriteBulk(const unsigned char* src, unsigned int size) {
-    Psyz_SpuMemWrite(spu.transfer_addr, src, size);
-    spu.transfer_addr = (spu.transfer_addr + size) & (PSYZ_SPU_RAM_SIZE - 1);
+    Psyz_SpuMemWrite(spu_hot.transfer_addr, src, size);
+    spu_hot.transfer_addr = (spu_hot.transfer_addr + size) & (PSYZ_SPU_RAM_SIZE - 1);
 }
 
 void Psyz_SpuMemRead(unsigned int offset, void* dst, unsigned int size) {
@@ -118,7 +134,7 @@ void Psyz_SpuMemWrite(unsigned int offset, const void* src, unsigned int size) {
 }
 
 static void spu_key_on_voice(int v) {
-    spu_voice_key_on(&spu.voice[v], &_spu_RXX->rxx.voice[v]);
+    spu_voice_key_on(&spu_hot.voice[v], &_spu_RXX->rxx.voice[v]);
 }
 
 void Psyz_SpuWrite(unsigned int reg_offset, unsigned short value) {
@@ -145,17 +161,17 @@ void Psyz_SpuWrite(unsigned int reg_offset, unsigned short value) {
     } else if (reg_offset == offsetof(SPU_RXX, key_off[0])) { // voices 0..15
         for (int v = 0; v < 16; v++) {
             if (value & (1u << v))
-                spu.voice[v].key_off = 1;
+                spu_hot.voice[v].key_off = 1;
         }
     } else if (reg_offset == offsetof(SPU_RXX, key_off[1])) { // voices 16..23
         for (int v = 0; v < 8; v++) {
             if (value & (1u << v))
-                spu.voice[16 + v].key_off = 1;
+                spu_hot.voice[16 + v].key_off = 1;
         }
     } else if (reg_offset == offsetof(SPU_RXX, trans_addr)) {
         Psyz_SpuSetTransferAddr((unsigned)value << 3);
     } else if (reg_offset == offsetof(SPU_RXX, rev_work_addr)) {
-        spu.reverb_cur = ((unsigned)value << 3) & 0x7FFFF;
+        spu_hot.reverb_cur = ((unsigned)value << 3) & 0x7FFFF;
     } else if (reg_offset == offsetof(SPU_RXX, trans_fifo)) {
         Psyz_SpuFifoWrite(value);
     }
@@ -168,7 +184,7 @@ unsigned short Psyz_SpuRead(unsigned int reg_offset) {
     }
     // offsetof is not an ICE under MSVC C mode, so it cannot be a case label.
     if (reg_offset == offsetof(SPU_RXX, trans_addr)) {
-        return (unsigned short)((spu.transfer_addr >> 3) & 0xFFFF);
+        return (unsigned short)((spu_hot.transfer_addr >> 3) & 0xFFFF);
     }
     if (reg_offset == offsetof(SPU_RXX, spustat)) {
         // lower 6 bits mirror SPUCNT's low bits
@@ -180,7 +196,7 @@ unsigned short Psyz_SpuRead(unsigned int reg_offset) {
 }
 
 static void write_capture(unsigned int idx, short val) {
-    unsigned int addr = (idx * 0x400) | spu.capture_pos;
+    unsigned int addr = (idx * 0x400) | spu_hot.capture_pos;
     if (addr < PSYZ_SPU_RAM_SIZE) {
         *(short*)&spu.ram[addr] = val;
     }
@@ -199,7 +215,7 @@ static inline int spu_s16(u16 value) { return (short)value; }
 
 static unsigned reverb_address(u16 raw_offset, int extra_bytes) {
     unsigned base = ((unsigned)_spu_RXX->rxx.rev_work_addr << 3) & 0x7FFFF;
-    unsigned addr = spu.reverb_cur + ((unsigned)raw_offset << 3) + extra_bytes;
+    unsigned addr = spu_hot.reverb_cur + ((unsigned)raw_offset << 3) + extra_bytes;
     addr &= 0x7FFFF;
     if (addr < base)
         addr = base + addr;
@@ -279,27 +295,27 @@ static void reverb_process_22050(
         reverb_write(apf2[channel], mix_b);
     }
 
-    spu.reverb_cur = (spu.reverb_cur + 2) & 0x7FFFF;
-    if (spu.reverb_cur < ((unsigned)r->rev_work_addr << 3))
-        spu.reverb_cur = (unsigned)r->rev_work_addr << 3;
+    spu_hot.reverb_cur = (spu_hot.reverb_cur + 2) & 0x7FFFF;
+    if (spu_hot.reverb_cur < ((unsigned)r->rev_work_addr << 3))
+        spu_hot.reverb_cur = (unsigned)r->rev_work_addr << 3;
 }
 
 static void reverb_tick(int input_left, int input_right, int output[2]) {
-    if (!spu.reverb_phase) {
-        spu.reverb_input[0] = clamp16(input_left);
-        spu.reverb_input[1] = clamp16(input_right);
-        output[0] = spu.reverb_previous[0];
-        output[1] = spu.reverb_previous[1];
+    if (!spu_hot.reverb_phase) {
+        spu_hot.reverb_input[0] = clamp16(input_left);
+        spu_hot.reverb_input[1] = clamp16(input_right);
+        output[0] = spu_hot.reverb_previous[0];
+        output[1] = spu_hot.reverb_previous[1];
     } else {
         short next[2];
-        reverb_process_22050((spu.reverb_input[0] + input_left) / 2,
-                             (spu.reverb_input[1] + input_right) / 2, next);
-        output[0] = (spu.reverb_previous[0] + next[0]) / 2;
-        output[1] = (spu.reverb_previous[1] + next[1]) / 2;
-        spu.reverb_previous[0] = next[0];
-        spu.reverb_previous[1] = next[1];
+        reverb_process_22050((spu_hot.reverb_input[0] + input_left) / 2,
+                             (spu_hot.reverb_input[1] + input_right) / 2, next);
+        output[0] = (spu_hot.reverb_previous[0] + next[0]) / 2;
+        output[1] = (spu_hot.reverb_previous[1] + next[1]) / 2;
+        spu_hot.reverb_previous[0] = next[0];
+        spu_hot.reverb_previous[1] = next[1];
     }
-    spu.reverb_phase ^= 1;
+    spu_hot.reverb_phase ^= 1;
 }
 
 // generate one frame at 44100hz with voices mix, cd playback and volume control
@@ -313,39 +329,39 @@ static void spu_tick(short* out) {
     int reverb_output[2];
 
     // Pre-fill CD ring buffer if running low
-    if (spu.cd_ring_count < CD_RING_LOW_WATER) {
-        size_t space = CD_RING_FRAMES - spu.cd_ring_count;
+    if (spu_hot.cd_ring_count < CD_RING_LOW_WATER) {
+        size_t space = CD_RING_FRAMES - spu_hot.cd_ring_count;
         size_t write_pos =
-            (spu.cd_ring_read + spu.cd_ring_count) & CD_RING_MASK;
+            (spu_hot.cd_ring_read + spu_hot.cd_ring_count) & CD_RING_MASK;
         // Fill into contiguous chunk up to end of array
         size_t chunk = CD_RING_FRAMES - write_pos;
         if (chunk > space)
             chunk = space;
         size_t got = Psyz_CdPullSamples(&spu.cd_ring[write_pos * 2], chunk);
-        spu.cd_ring_count += got;
+        spu_hot.cd_ring_count += got;
     }
 
     // Read one stereo frame from CD ring buffer
     int cd_left = 0, cd_right = 0;
-    if (spu.cd_ring_count > 0) {
-        cd_left = spu.cd_ring[spu.cd_ring_read * 2];
-        cd_right = spu.cd_ring[spu.cd_ring_read * 2 + 1];
-        spu.cd_ring_read = (spu.cd_ring_read + 1) & CD_RING_MASK;
-        spu.cd_ring_count--;
+    if (spu_hot.cd_ring_count > 0) {
+        cd_left = spu.cd_ring[spu_hot.cd_ring_read * 2];
+        cd_right = spu.cd_ring[spu_hot.cd_ring_read * 2 + 1];
+        spu_hot.cd_ring_read = (spu_hot.cd_ring_read + 1) & CD_RING_MASK;
+        spu_hot.cd_ring_count--;
     }
 
     // decode+resample, scale volume by ADSR envelope, then mix voices
     short v1_sample = 0, v3_sample = 0;
     for (int v = 0; v < PSYZ_SPU_NUM_VOICES; v++) {
-        if (!spu.voice[v].active)
+        if (!spu_hot.voice[v].active)
             continue;
-        short s = spu_voice_step(&spu.voice[v], rxx->voice[v].pitch, spu.ram);
-        spu_voice_envelope_step(&spu.voice[v]);
-        if (spu.voice[v].env_state == ADSR_OFF) {
+        short s = spu_voice_step(&spu_hot.voice[v], rxx->voice[v].pitch, spu.ram);
+        spu_voice_envelope_step(&spu_hot.voice[v]);
+        if (spu_hot.voice[v].env_state == ADSR_OFF) {
             s = 0;
         }
-        rxx->voice[v].volumex = (unsigned short)spu.voice[v].env_vol;
-        s = (short)(((int)s * spu.voice[v].env_vol) >> 15);
+        rxx->voice[v].volumex = (unsigned short)spu_hot.voice[v].env_vol;
+        s = (short)(((int)s * spu_hot.voice[v].env_vol) >> 15);
         if (v == 1) {
             v1_sample = s;
         } else if (v == 3) {
@@ -398,15 +414,15 @@ static void spu_tick(short* out) {
     write_capture(3, v3_sample);
 
     // SPUSTAT bit 11 flips when capture_pos crosses 0x200
-    unsigned prev_pos = spu.capture_pos;
-    spu.capture_pos = (prev_pos + 2) & 0x3FF;
-    if ((prev_pos ^ spu.capture_pos) & 0x200) {
+    unsigned prev_pos = spu_hot.capture_pos;
+    spu_hot.capture_pos = (prev_pos + 2) & 0x3FF;
+    if ((prev_pos ^ spu_hot.capture_pos) & 0x200) {
         rxx->spustat ^= 1u << 11;
     }
 }
 
 void Psyz_SpuPullSamples(short* out, int num_frames) {
-    if (!spu.initialized) {
+    if (!spu_hot.initialized) {
         memset(out, 0, num_frames * 2 * sizeof(short));
         return;
     }
